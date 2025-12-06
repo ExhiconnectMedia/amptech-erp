@@ -1,31 +1,26 @@
 # app.py
 import streamlit as st
-from database import ensure_tables, get_engine
-from sqlalchemy import insert, select
-from invoice_template import generate_invoice_pdf
-import pandas as pd
-import base64, io, smtplib
-from email.message import EmailMessage
 from datetime import datetime
+from database import ensure_tables, insert_invoice, fetch_all_invoices, fetch_invoice_by_id
+from invoice_template import render_html
+import base64, io
 
 st.set_page_config(page_title="Amptech ERP", layout="wide")
+ensure_tables()
 
-# --- Setup DB ---
-engine, invoices_table = ensure_tables()
+# Company config and users from secrets (or defaults)
+company_cfg = {"name":"Exhiconnect Media Pvt Ltd","address":"Opp. Vikas Bhavan, Sidcul, Haridwar","gstin":""}
+try:
+    if st.secrets.get("company"):
+        company_cfg.update(st.secrets.get("company"))
+except Exception:
+    pass
 
-# Company config: override with st.secrets.company optional
-company_cfg = st.secrets.get("company", {"name":"Exhiconnect Media Pvt Ltd", "address":"Ahmedabad, India", "gstin":""})
-
-# Simple user auth (not secure for production). You can add password in secrets.users
-USERS = {
-    "bhavik":"pass",
-    "chirag":"pass",
-    "karishma":"pass"
-}
-if "users" in st.secrets:
-    u = st.secrets["users"]
-    for k,v in u.items():
-        USERS[k] = v
+DEFAULT_USERS = {"bhavik":"12345","chirag":"12345","karishma":"12345"}
+try:
+    users = dict(st.secrets.get("users", DEFAULT_USERS))
+except Exception:
+    users = DEFAULT_USERS
 
 def login_widget():
     if "logged_in" not in st.session_state:
@@ -34,13 +29,13 @@ def login_widget():
     if not st.session_state.logged_in:
         with st.sidebar.form("login"):
             st.write("Login")
-            user = st.selectbox("User", list(USERS.keys()))
+            user = st.selectbox("User", list(users.keys()))
             pwd = st.text_input("Password", type="password")
-            submitted = st.form_submit_button("Login")
-            if submitted:
-                if USERS.get(user) == pwd:
+            if st.form_submit_button("Login"):
+                if users.get(user) == pwd:
                     st.session_state.logged_in = True
                     st.session_state.user = user
+                    st.success("Logged in as " + user)
                     st.experimental_rerun()
                 else:
                     st.error("Invalid credentials")
@@ -53,22 +48,19 @@ def login_widget():
 
 login_widget()
 if not st.session_state.logged_in:
-    st.info("Please login from the left panel.")
     st.stop()
 
-st.title("Amptech ERP - Invoicing")
+st.title("Amptech ERP (Streamlit)")
 
-# Top-level actions
 col1, col2, col3 = st.columns([2,1,1])
 with col1:
     if st.button("Create New Invoice"):
         st.session_state.show_create = True
 with col2:
     if st.button("Load Demo Data"):
-        # insert few fake entries
-        conn = engine.connect()
+        # create 3 demo invoices
         for i in range(1,4):
-            invoice_no = f"DEMO-{datetime.utcnow().strftime('%y%m')}-{i}"
+            invoice_no = f"DEMO-{datetime.utcnow().strftime('%y%m%d%H%M%S')}-{i}"
             data = dict(
                 invoice_no=invoice_no,
                 type="ProForma",
@@ -97,19 +89,13 @@ with col2:
                 balance=(9*8000)*(1+0.18),
                 account_manager=st.session_state.user,
                 status="Pending",
-                created_at=datetime.utcnow()
+                created_at=datetime.utcnow().isoformat()
             )
-            conn.execute(invoices_table.insert().values(**data))
-        conn.close()
-        st.success("Demo data inserted.")
+            insert_invoice(data)
+        st.success("Inserted demo invoices.")
 with col3:
-    if st.button("Refresh List"):
+    if st.button("Refresh"):
         st.experimental_rerun()
-
-# Sidebar filters
-st.sidebar.header("Filters")
-q_company = st.sidebar.text_input("Company (search)")
-status_filter = st.sidebar.multiselect("Status", options=["Pending","Clear","Complimentary","Media Partner","Cancelled","Defaulted"], default=["Pending","Clear"])
 
 # Create invoice form
 if st.session_state.get("show_create", False):
@@ -132,10 +118,9 @@ if st.session_state.get("show_create", False):
         advance_paid = st.number_input("Advance Paid (₹)", min_value=0.0, value=0.0)
         account_manager = st.selectbox("Account Manager", ["Bhavik","Chirag","Karishma"])
         status = st.selectbox("Status", ["Pending","Clear","Complimentary","Media Partner","Cancelled","Defaulted"])
-        submit = st.form_submit_button("Save & Generate PDF")
+        submit = st.form_submit_button("Save & Render Invoice")
 
     if submit:
-        # calculations
         total_sqm_amount = round(qty_sqm * rate_per_sqm, 2)
         taxable_value = round(total_sqm_amount - discount_amount + extras_basic_total + sponsorship_basic, 2)
         gst_amount = round(taxable_value * gst_percent / 100.0, 2)
@@ -174,87 +159,40 @@ if st.session_state.get("show_create", False):
             balance=balance,
             account_manager=account_manager,
             status=status,
-            created_at=datetime.utcnow()
+            created_at=datetime.utcnow().isoformat()
         )
 
-        conn = engine.connect()
-        res = conn.execute(invoices_table.insert().values(**data))
-        conn.close()
+        invoice_id = insert_invoice(data)
         st.success("Invoice saved: " + invoice_no)
+        # Render HTML invoice
+        html = render_html(data, company_cfg)
+        st.markdown("### Invoice Preview (rendered HTML)")
+        st.components.v1.html(html, height=800, scrolling=True)
 
-        # generate PDF bytes
-        pdf_bytes = generate_invoice_pdf(data, company_cfg)
-        b64 = base64.b64encode(pdf_bytes).decode()
-        href = f'<a href="data:application/pdf;base64,{b64}" download="{invoice_no}.pdf">Download PDF</a>'
-        st.markdown(href, unsafe_allow_html=True)
+        # Download HTML as file
+        b = html.encode("utf-8")
+        st.download_button("Download invoice as HTML", data=b, file_name=f"{invoice_no}.html", mime="text/html")
 
-        # optional: email pdf
-        send_email = st.checkbox("Send invoice by email to client (requires SMTP secrets)", value=False)
-        if send_email and email:
-            try:
-                send_pdf_via_smtp(pdf_bytes, invoice_no, email, company_cfg)
-                st.success("Email sent to " + email)
-            except Exception as e:
-                st.error("Email failed: " + str(e))
+        st.info("To get a PDF: open the downloaded HTML in your browser and use Print → Save as PDF (or right-click on preview and Print).")
 
-# List invoices
+# Show list of invoices
 st.subheader("Invoices")
-conn = engine.connect()
-qry = select(invoices_table).order_by(invoices_table.c.created_at.desc())
-rows = conn.execute(qry).mappings().all()
-conn.close()
-df = pd.DataFrame(rows)
-if not df.empty:
-    if q_company:
-        df = df[df['company_name'].str.contains(q_company, case=False, na=False)]
-    if status_filter:
-        df = df[df['status'].isin(status_filter)]
-    st.dataframe(df[['id','invoice_no','company_name','event_name','total_with_gst','balance','status','created_at']].rename(columns={
-        'id':'ID','invoice_no':'Invoice','company_name':'Company','event_name':'Event','total_with_gst':'Total (₹)','balance':'Balance (₹)','status':'Status','created_at':'Date'
+rows = fetch_all_invoices()
+if rows:
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    st.dataframe(df[["id","invoice_no","company_name","event_name","total_with_gst","balance","status","created_at"]].rename(columns={
+        "id":"ID","invoice_no":"Invoice","company_name":"Company","event_name":"Event","total_with_gst":"Total (₹)","balance":"Balance (₹)","status":"Status","created_at":"Date"
     }))
-    # download CSV
-    csv = df.to_csv(index=False).encode('utf-8')
-    st.download_button("Export as CSV", data=csv, file_name="invoices.csv", mime="text/csv")
-    # download selected invoice pdf
-    sel = st.number_input("Download Invoice ID", min_value=0, value=0, step=1)
-    if st.button("Download Selected as PDF"):
+    sel = st.number_input("View invoice ID", min_value=0, value=0, step=1)
+    if st.button("Render Selected Invoice"):
         if sel>0:
-            row = df[df['id']==sel]
-            if not row.empty:
-                invoice_data = row.iloc[0].to_dict()
-                pdf_bytes = generate_invoice_pdf(invoice_data, company_cfg)
-                st.download_button(label="Download PDF", data=pdf_bytes, file_name=f"{invoice_data['invoice_no']}.pdf", mime="application/pdf")
+            inv = fetch_invoice_by_id(sel)
+            if inv:
+                html = render_html(inv, company_cfg)
+                st.components.v1.html(html, height=800, scrolling=True)
+                st.download_button("Download HTML", data=html.encode("utf-8"), file_name=f"{inv['invoice_no']}.html", mime="text/html")
             else:
-                st.warning("ID not found")
+                st.warning("Invoice ID not found")
 else:
-    st.info("No invoices yet - create one or load demo data.")
-
-# helper for email
-def send_pdf_via_smtp(pdf_bytes, invoice_no, recipient, company_cfg):
-    # streamlit secrets for smtp: st.secrets["smtp"]
-    import streamlit as st
-    smtp = st.secrets.get("smtp", {})
-    if not smtp:
-        raise Exception("SMTP config missing in streamlit secrets.")
-    host = smtp.get("host")
-    port = smtp.get("port", 587)
-    username = smtp.get("username")
-    password = smtp.get("password")
-    from_email = smtp.get("from_email", f"no-reply@{st.secrets.get('site','localhost')}")
-    subject = f"Proforma Invoice - {invoice_no}"
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = from_email
-    msg["To"] = recipient
-    msg.set_content(f"Please find attached the Proforma Invoice {invoice_no}.")
-    msg.add_attachment(pdf_bytes, maintype="application", subtype="pdf", filename=f"{invoice_no}.pdf")
-    # send
-    server = smtplib.SMTP(host, int(port))
-    try:
-        server.starttls()
-    except Exception:
-        pass
-    if username:
-        server.login(username, password)
-    server.send_message(msg)
-    server.quit()
+    st.info("No invoices yet.")

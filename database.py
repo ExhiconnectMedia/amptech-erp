@@ -1,71 +1,86 @@
 # database.py
-from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, Float, DateTime, Text
-from sqlalchemy.exc import OperationalError
+import sqlite3
 import os
 from datetime import datetime
 
-def get_engine():
-    # Streamlit cloud secrets expected:
-    # {"db": {"dialect":"mysql", "user":"...", "password":"...", "host":"...", "port":"3306", "database":"u669232811_erp"}}
-    # If not present, use local sqlite file
-    try:
-        import streamlit as st
-        secret = st.secrets.get("db", None)
-    except Exception:
-        secret = None
+DB_FILE = os.path.join(os.path.dirname(__file__), "erp_data.sqlite3")
 
-    if secret and secret.get("dialect","").startswith("mysql"):
-        user = secret["user"]
-        password = secret["password"]
-        host = secret["host"]
-        port = secret.get("port", "3306")
-        database = secret["database"]
-        url = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
-    else:
-        # local sqlite fallback
-        db_file = os.path.join(os.path.dirname(__file__), "erp_data.sqlite")
-        url = f"sqlite:///{db_file}"
+CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    invoice_no TEXT UNIQUE,
+    type TEXT,
+    company_name TEXT,
+    email TEXT,
+    gst_number TEXT,
+    address TEXT,
+    event_name TEXT,
+    event_location TEXT,
+    stall_number TEXT,
+    qty_sqm REAL,
+    space_type TEXT,
+    rate_per_sqm REAL,
+    total_sqm_amount REAL,
+    discount_amount REAL,
+    extras_basic_total REAL,
+    sponsorship_basic REAL,
+    taxable_value REAL,
+    gst_percent REAL,
+    gst_amount REAL,
+    cgst REAL,
+    sgst REAL,
+    igst REAL,
+    total_with_gst REAL,
+    advance_paid REAL,
+    balance REAL,
+    account_manager TEXT,
+    status TEXT,
+    created_at TEXT
+);
+"""
 
-    engine = create_engine(url, echo=False, future=True)
-    return engine
+def get_conn():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def ensure_tables():
-    engine = get_engine()
-    meta = MetaData()
-    invoices = Table(
-        "invoices", meta,
-        Column("id", Integer, primary_key=True, autoincrement=True),
-        Column("invoice_no", String(100), nullable=False, unique=True),
-        Column("type", String(50)),
-        Column("company_name", String(255)),
-        Column("email", String(255)),
-        Column("gst_number", String(50)),
-        Column("address", Text),
-        Column("event_name", String(150)),
-        Column("event_location", String(150)),
-        Column("stall_number", String(50)),
-        Column("qty_sqm", Float),
-        Column("space_type", String(50)),
-        Column("rate_per_sqm", Float),
-        Column("total_sqm_amount", Float),
-        Column("discount_amount", Float),
-        Column("extras_basic_total", Float),
-        Column("sponsorship_basic", Float),
-        Column("taxable_value", Float),
-        Column("gst_percent", Float),
-        Column("gst_amount", Float),
-        Column("cgst", Float),
-        Column("sgst", Float),
-        Column("igst", Float),
-        Column("total_with_gst", Float),
-        Column("advance_paid", Float),
-        Column("balance", Float),
-        Column("account_manager", String(100)),
-        Column("status", String(100)),
-        Column("created_at", DateTime, default=datetime.utcnow)
-    )
-    try:
-        meta.create_all(engine)
-    except OperationalError as e:
-        raise
-    return engine, invoices
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.executescript(CREATE_SQL)
+    conn.commit()
+    conn.close()
+
+def insert_invoice(data: dict):
+    conn = get_conn()
+    cur = conn.cursor()
+    cols = [
+        "invoice_no","type","company_name","email","gst_number","address",
+        "event_name","event_location","stall_number","qty_sqm","space_type",
+        "rate_per_sqm","total_sqm_amount","discount_amount","extras_basic_total",
+        "sponsorship_basic","taxable_value","gst_percent","gst_amount","cgst","sgst","igst",
+        "total_with_gst","advance_paid","balance","account_manager","status","created_at"
+    ]
+    placeholders = ",".join("?" for _ in cols)
+    values = [data.get(c) for c in cols]
+    cur.execute(f"INSERT INTO invoices ({','.join(cols)}) VALUES ({placeholders})", values)
+    conn.commit()
+    invoice_id = cur.lastrowid
+    conn.close()
+    return invoice_id
+
+def fetch_all_invoices():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM invoices ORDER BY id DESC")
+    rows = [dict(row) for row in cur.fetchall()]
+    conn.close()
+    return rows
+
+def fetch_invoice_by_id(invoice_id):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM invoices WHERE id = ?", (invoice_id,))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
