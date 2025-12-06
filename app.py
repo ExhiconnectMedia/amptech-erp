@@ -1,15 +1,15 @@
 # app.py
 import streamlit as st
 from datetime import datetime
-from database import ensure_tables, insert_invoice, fetch_all_invoices, fetch_invoice_by_id
+from database import ensure_tables, insert_invoice, fetch_all_invoices, fetch_invoice_by_id, record_payment
 from invoice_template import render_html
-import base64, io
+import base64, io, requests
 
 st.set_page_config(page_title="Amptech ERP", layout="wide")
 ensure_tables()
 
 # Company config and users from secrets (or defaults)
-company_cfg = {"name":"Exhiconnect Media Pvt Ltd","address":"Opp. Vikas Bhavan, Sidcul, Haridwar","gstin":""}
+company_cfg = {"name":"Exhiconnect Media Pvt Ltd","address":"Opp. Vikas Bhavan, Sidcul, Haridwar","gstin":"","company_state_code":""}
 try:
     if st.secrets.get("company"):
         company_cfg.update(st.secrets.get("company"))
@@ -21,6 +21,17 @@ try:
     users = dict(st.secrets.get("users", DEFAULT_USERS))
 except Exception:
     users = DEFAULT_USERS
+
+# Indian states + GST state codes mapping (short list; expand if needed)
+INDIAN_STATES = [
+    ("Andhra Pradesh","28"),("Arunachal Pradesh","12"),("Assam","18"),("Bihar","10"),
+    ("Chhattisgarh","22"),("Goa","30"),("Gujarat","24"),("Haryana","06"),("Himachal Pradesh","02"),
+    ("Jammu & Kashmir","01"),("Jharkhand","20"),("Karnataka","29"),("Kerala","32"),("Madhya Pradesh","23"),
+    ("Maharashtra","27"),("Manipur","14"),("Meghalaya","17"),("Mizoram","15"),("Nagaland","13"),
+    ("Odisha","21"),("Punjab","03"),("Rajasthan","08"),("Sikkim","11"),("Tamil Nadu","33"),
+    ("Telangana","36"),("Tripura","16"),("Uttar Pradesh","09"),("Uttarakhand","05"),("West Bengal","19"),
+    ("Delhi","07"),("Puducherry","34"),("Chandigarh","04"),("Ladakh","38")
+]
 
 def login_widget():
     if "logged_in" not in st.session_state:
@@ -58,12 +69,11 @@ with col1:
         st.session_state.show_create = True
 with col2:
     if st.button("Load Demo Data"):
-        # create 3 demo invoices
         for i in range(1,4):
             invoice_no = f"DEMO-{datetime.utcnow().strftime('%y%m%d%H%M%S')}-{i}"
             data = dict(
                 invoice_no=invoice_no,
-                type="ProForma",
+                type="Proforma",
                 company_name=f"Demo Company {i}",
                 email="demo@example.com",
                 gst_number="",
@@ -89,6 +99,9 @@ with col2:
                 balance=(9*8000)*(1+0.18),
                 account_manager=st.session_state.user,
                 status="Pending",
+                billing_state="Gujarat",
+                billing_state_code="24",
+                company_state_code=company_cfg.get("company_state_code",""),
                 created_at=datetime.utcnow().isoformat()
             )
             insert_invoice(data)
@@ -101,10 +114,15 @@ with col3:
 if st.session_state.get("show_create", False):
     st.subheader("Create New Invoice")
     with st.form("invoice_create"):
+        invoice_type = st.selectbox("Invoice Type", ["Proforma","Tax Invoice","Payment Receipt"])
         company_name = st.text_input("Company Name", "")
         address = st.text_area("Address", "")
-        gst_number = st.text_input("GST Number", "")
-        email = st.text_input("Email")
+        gst_number = st.text_input("GST Number")
+        # Billing state
+        billing_state = st.selectbox("Billing State", [s[0] for s in INDIAN_STATES])
+        billing_state_code = dict(INDIAN_STATES)[billing_state]
+        # Show company state code from config if set (company_cfg.company_state_code)
+        company_state_code = company_cfg.get("company_state_code","")
         event_name = st.selectbox("Event Name", ["Amptech India Expo", "Auto India Expo", "Career Bonanza Expo"])
         event_location = st.selectbox("Event Location", ["Vadodara","Haridwar","Indore","Ahmedabad","Surat"])
         stall_number = st.text_input("Stall Number")
@@ -124,18 +142,24 @@ if st.session_state.get("show_create", False):
         total_sqm_amount = round(qty_sqm * rate_per_sqm, 2)
         taxable_value = round(total_sqm_amount - discount_amount + extras_basic_total + sponsorship_basic, 2)
         gst_amount = round(taxable_value * gst_percent / 100.0, 2)
-        cgst = round(gst_amount/2, 2)
-        sgst = round(gst_amount/2, 2)
-        igst = 0.0
+        # decide cgst/sgst vs igst
+        if company_state_code and str(billing_state_code) != str(company_state_code):
+            igst = gst_amount
+            cgst = 0.0
+            sgst = 0.0
+        else:
+            igst = 0.0
+            cgst = round(gst_amount/2, 2)
+            sgst = round(gst_amount/2, 2)
         total_with_gst = round(taxable_value + gst_amount, 2)
         balance = round(total_with_gst - advance_paid, 2)
-        invoice_no = f"PRO-{datetime.utcnow().year}-{str(abs(hash(datetime.utcnow())))[0:6]}"
+        invoice_no = f"{'PRO' if invoice_type=='Proforma' else ('TAX' if invoice_type=='Tax Invoice' else 'REC')}-{datetime.utcnow().year}-{str(abs(hash(datetime.utcnow())))[0:6]}"
 
         data = dict(
             invoice_no=invoice_no,
-            type="ProForma",
+            type=invoice_type,
             company_name=company_name,
-            email=email,
+            email=gst_number and gst_number or "",
             gst_number=gst_number,
             address=address,
             event_name=event_name,
@@ -159,6 +183,9 @@ if st.session_state.get("show_create", False):
             balance=balance,
             account_manager=account_manager,
             status=status,
+            billing_state=billing_state,
+            billing_state_code=billing_state_code,
+            company_state_code=company_state_code,
             created_at=datetime.utcnow().isoformat()
         )
 
@@ -169,11 +196,36 @@ if st.session_state.get("show_create", False):
         st.markdown("### Invoice Preview (rendered HTML)")
         st.components.v1.html(html, height=800, scrolling=True)
 
-        # Download HTML as file
+        # DOWNLOAD options
         b = html.encode("utf-8")
         st.download_button("Download invoice as HTML", data=b, file_name=f"{invoice_no}.html", mime="text/html")
 
-        st.info("To get a PDF: open the downloaded HTML in your browser and use Print → Save as PDF (or right-click on preview and Print).")
+        # If pdfshift key in secrets, show one-click server PDF
+        pdfshift_key = None
+        try:
+            pdfshift_key = st.secrets["pdfshift"]["key"]
+        except Exception:
+            pdfshift_key = None
+
+        if pdfshift_key:
+            if st.button("Generate PDF (server-side)"):
+                with st.spinner("Generating PDF via PDFShift..."):
+                    try:
+                        resp = requests.post(
+                            "https://api.pdfshift.io/v3/convert/",
+                            json={"source": html},
+                            auth=(pdfshift_key, "")
+                        )
+                        if resp.status_code == 200:
+                            pdf_bytes = resp.content
+                            st.download_button("Download PDF", data=pdf_bytes, file_name=f"{invoice_no}.pdf", mime="application/pdf")
+                            st.success("PDF ready — download button shown.")
+                        else:
+                            st.error(f"PDF service error: {resp.status_code} - {resp.text[:200]}")
+                    except Exception as e:
+                        st.exception(e)
+        else:
+            st.info("Server-side PDF (one-click) is not enabled. To enable, add PDFShift API key in Streamlit Secrets as pdfshift.key. Meanwhile, use Print → Save as PDF from the preview.")
 
 # Show list of invoices
 st.subheader("Invoices")
@@ -192,6 +244,13 @@ if rows:
                 html = render_html(inv, company_cfg)
                 st.components.v1.html(html, height=800, scrolling=True)
                 st.download_button("Download HTML", data=html.encode("utf-8"), file_name=f"{inv['invoice_no']}.html", mime="text/html")
+                # quick receipt/payment recording option
+                if st.button("Record Payment for this invoice"):
+                    amt = st.number_input("Payment amount", min_value=0.0, value=float(inv.get("total_with_gst") or 0))
+                    if st.button("Confirm Payment"):
+                        res = record_payment(inv["id"], amt)
+                        st.success(f"Recorded payment. New advance: {res['advance_paid']:.2f}, Balance: {res['balance']:.2f}")
+                        st.experimental_rerun()
             else:
                 st.warning("Invoice ID not found")
 else:
